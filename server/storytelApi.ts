@@ -62,6 +62,7 @@ interface RawBookshelfModel {
   id: string;
   title: string;
   state: "CONSUMING" | "CONSUMED" | "WILL_CONSUME" | string;
+  stateUpdateTime?: string;
   kidsBook?: boolean;
   authors?: RawBookshelfNamedEntity[];
   narrators?: RawBookshelfNamedEntity[];
@@ -81,6 +82,8 @@ interface RawBookshelfResponse {
 interface BookShelfEntity {
   id: string;
   status: number;
+  stateUpdateTime?: string;
+  positionUpdatedTime?: string;
   book: {
     name: string;
     authorsAsString: string;

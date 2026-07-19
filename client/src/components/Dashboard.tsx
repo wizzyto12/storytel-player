@@ -69,7 +69,12 @@ function Dashboard({onLogout, triggerLogout, setTriggerLogout}: DashboardProps) 
         try {
             setIsLoading(true);
             const response = await api.get<BookShelfResponse>('/bookshelf');
-            setBooks(response.data.books);
+            const onlineBooks = response.data.books || [];
+            setBooks(onlineBooks);
+            // Populate metadata for downloads created by older app versions.
+            // The endpoint skips books that are not downloaded or already cached.
+            void api.post('/offline/metadata/backfill', {books: onlineBooks})
+                .catch(error => console.warn('Failed to backfill offline metadata', error));
         } catch (error: any) {
             // Bookshelf requires Storytel API; on failure (typically offline)
             // fall back to whatever is cached from previous downloads. If the

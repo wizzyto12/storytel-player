@@ -4,7 +4,7 @@
 // 640px variant, so there is no smaller size to request.
 export const buildCoverUrl = (cover?: string | null): string => {
     if (!cover) return '';
-    return /^https?:\/\//.test(cover) ? cover : `https://www.storytel.com${cover}`;
+    return /^(https?|file|data):/i.test(cover) ? cover : `https://www.storytel.com${cover}`;
 };
 
 // Turn an ISO language code (e.g. "de") into a name localized in the given UI

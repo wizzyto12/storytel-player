@@ -8,6 +8,14 @@ import fs from "fs";
 import path from "path";
 import axios from "axios";
 import { appLogger } from "./logger";
+import {
+  OfflineBook,
+  loadOfflineBookDetails,
+  loadOfflineBooks,
+  loadOfflinePlaybackMetadata,
+  persistOfflineMetadata,
+  removeOfflineMetadata,
+} from "./offlineMetadata";
 
 // Extend JWT user type. Legacy (email/password) login populates storytelToken
 // and jwt; SSO login populates the sso* fields instead and leaves the legacy
@@ -96,6 +104,36 @@ const activeDownloads = new Map<
     filePath: string;
   }
 >();
+
+async function cacheDownloadedBook(
+  audioFilePath: string,
+  book: OfflineBook | undefined,
+  storytelClient: StorytelClient,
+  force = false,
+): Promise<boolean> {
+  if (!book) return false;
+  try {
+    const result = await persistOfflineMetadata({
+      audioFilePath,
+      book,
+      storytelClient,
+      force,
+    });
+    return result.cached && result.tagged;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Unable to save offline audiobook metadata: ${message}`);
+    return false;
+  }
+}
+
+function validateBookId(value: unknown): string {
+  const bookId = String(value ?? "");
+  if (!/^[A-Za-z0-9_-]+$/.test(bookId)) {
+    throw new Error("Invalid audiobook ID");
+  }
+  return bookId;
+}
 
 const fastify = Fastify({ logger: process.env.NODE_ENV !== "production" });
 
@@ -213,6 +251,62 @@ fastify.get(
   },
 );
 
+fastify.get(
+  "/api/offline/bookshelf",
+  {
+    preHandler: fastify.authenticate,
+  },
+  async (_request, reply) => {
+    try {
+      reply.send({ books: loadOfflineBooks(DOWNLOADS_DIR) });
+    } catch (error: any) {
+      replyError(reply, error);
+    }
+  },
+);
+
+fastify.post<{
+  Body: { books?: OfflineBook[] };
+}>(
+  "/api/offline/metadata/backfill",
+  {
+    preHandler: fastify.authenticate,
+  },
+  async (request, reply) => {
+    try {
+      const books = Array.isArray(request.body.books) ? request.body.books : [];
+      const storytelClient = hydrateStorytelClient(request.user);
+      let cached = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      for (const book of books) {
+        let bookId: string;
+        try {
+          bookId = validateBookId(book?.abook?.id);
+        } catch {
+          failed += 1;
+          continue;
+        }
+        const audioFilePath = path.join(DOWNLOADS_DIR, `${bookId}.mp3`);
+        if (!fs.existsSync(audioFilePath)) {
+          skipped += 1;
+          continue;
+        }
+        if (await cacheDownloadedBook(audioFilePath, book, storytelClient)) {
+          cached += 1;
+        } else {
+          failed += 1;
+        }
+      }
+
+      reply.send({ success: failed === 0, cached, skipped, failed });
+    } catch (error: any) {
+      replyError(reply, error);
+    }
+  },
+);
+
 // Route per ottenere stream URL
 fastify.post<{
   Body: { bookId: string; consumableId?: string };
@@ -223,7 +317,8 @@ fastify.post<{
   },
   async (request, reply) => {
     try {
-      const { bookId, consumableId } = request.body;
+      const { bookId: requestedBookId, consumableId } = request.body;
+      const bookId = validateBookId(requestedBookId);
       const localFilePath = path.join(DOWNLOADS_DIR, `${bookId}.mp3`);
 
       // Check if file exists locally
@@ -378,6 +473,22 @@ fastify.get<{
   },
 );
 
+fastify.get<{
+  Params: { consumableId: string };
+}>(
+  "/api/offline/bookmetadata/:consumableId",
+  {
+    preHandler: fastify.authenticate,
+  },
+  async (request, reply) => {
+    try {
+      reply.send(loadOfflinePlaybackMetadata(request.params.consumableId));
+    } catch (error: any) {
+      reply.code(404).send({ error: error.message });
+    }
+  },
+);
+
 fastify.put<{
   Params: { consumableId: string };
   Body: { position: number };
@@ -423,6 +534,22 @@ fastify.get<{
       reply.send(bookmarks);
     } catch (error: any) {
       replyError(reply, error);
+    }
+  },
+);
+
+fastify.get<{
+  Params: { consumableId: string };
+}>(
+  "/api/offline/book-details/:consumableId",
+  {
+    preHandler: fastify.authenticate,
+  },
+  async (request, reply) => {
+    try {
+      reply.send(loadOfflineBookDetails(request.params.consumableId));
+    } catch (error: any) {
+      reply.code(404).send({ error: error.message });
     }
   },
 );
@@ -546,7 +673,7 @@ fastify.get<{
 
 // Route per scaricare il file audio da remoto
 fastify.post<{
-  Body: { bookId: string; consumableId?: string };
+  Body: { bookId: string; consumableId?: string; book?: OfflineBook };
 }>(
   "/api/download",
   {
@@ -554,15 +681,23 @@ fastify.post<{
   },
   async (request, reply) => {
     try {
-      const { bookId, consumableId } = request.body;
+      const { bookId: requestedBookId, consumableId, book } = request.body;
+      const bookId = validateBookId(requestedBookId);
       const localFilePath = path.join(DOWNLOADS_DIR, `${bookId}.mp3`);
+      const storytelClient = hydrateStorytelClient(request.user);
 
       // Check if already exists
       if (fs.existsSync(localFilePath)) {
+        const metadataSaved = await cacheDownloadedBook(
+          localFilePath,
+          book,
+          storytelClient,
+        );
         return reply.send({
           success: true,
           message: "File already downloaded",
           percentage: 100,
+          metadataSaved,
         });
       }
 
@@ -571,7 +706,6 @@ fastify.post<{
       }
 
       // Get stream URL
-      const storytelClient = hydrateStorytelClient(request.user);
       // Prefer the new api.storytel.net assets endpoint (needs consumableId);
       // fall back to the legacy programId-based stream if not provided.
       const streamUrl = consumableId
@@ -628,11 +762,18 @@ fastify.post<{
 
         // Clean up
         activeDownloads.delete(bookId);
+        const metadataSaved = await cacheDownloadedBook(
+          localFilePath,
+          book,
+          storytelClient,
+          true,
+        );
 
         reply.send({
           success: true,
           message: "Download completed",
           percentage: 100,
+          metadataSaved,
         });
       } catch (error: any) {
         // Clean up on error
@@ -665,7 +806,7 @@ fastify.delete<{
   },
   async (request, reply) => {
     try {
-      const { bookId } = request.params;
+      const bookId = validateBookId(request.params.bookId);
 
       const download = activeDownloads.get(bookId);
       if (!download) {
@@ -707,7 +848,7 @@ fastify.get<{ Params: { bookId: string } }>(
   "/api/local-stream/:bookId",
   async (request, reply) => {
     try {
-      const { bookId } = request.params;
+      const bookId = validateBookId(request.params.bookId);
       const filePath = path.join(DOWNLOADS_DIR, `${bookId}.mp3`);
 
       if (!fs.existsSync(filePath)) {
@@ -765,7 +906,7 @@ fastify.get<{
   },
   async (request, reply) => {
     try {
-      const { bookId } = request.params;
+      const bookId = validateBookId(request.params.bookId);
       const localFilePath = path.join(DOWNLOADS_DIR, `${bookId}.mp3`);
 
       if (!fs.existsSync(localFilePath)) {
@@ -790,7 +931,7 @@ fastify.get<{
   },
   async (request, reply) => {
     try {
-      const { bookId } = request.params;
+      const bookId = validateBookId(request.params.bookId);
       const localFilePath = path.join(DOWNLOADS_DIR, `${bookId}.mp3`);
 
       const exists = fs.existsSync(localFilePath);
@@ -811,7 +952,7 @@ fastify.delete<{
   },
   async (request, reply) => {
     try {
-      const { bookId } = request.params;
+      const bookId = validateBookId(request.params.bookId);
       const localFilePath = path.join(DOWNLOADS_DIR, `${bookId}.mp3`);
 
       if (!fs.existsSync(localFilePath)) {
@@ -820,6 +961,7 @@ fastify.delete<{
 
       // Delete the file
       fs.unlinkSync(localFilePath);
+      removeOfflineMetadata(bookId);
 
       reply.send({ success: true, message: "File deleted successfully" });
     } catch (error: any) {

@@ -48,8 +48,16 @@ function BookView() {
                 setDescription(data.description || '');
                 setLanguage(localizedLanguageName(data.language, i18n.language));
             })
-            .catch(() => {
-                /* keep empty fallbacks on failure */
+            .catch(async () => {
+                try {
+                    const res = await api.get(`/offline/book-details/${consumableId}`);
+                    if (cancelled) return;
+                    const data = res.data || {};
+                    setDescription(data.description || '');
+                    setLanguage(localizedLanguageName(data.language, i18n.language));
+                } catch {
+                    /* keep empty fallbacks when no offline details exist */
+                }
             });
         return () => {
             cancelled = true;
